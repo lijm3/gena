@@ -1,0 +1,155 @@
+"""
+工具分发器 - s02: 统一的工具处理接口
+"""
+import json
+from typing import Callable, Dict, Optional
+
+from tools.base_tools import run_bash, run_read, run_write, run_edit
+from managers.todo_manager import TodoManager
+from agents.subagent import run_subagent
+from managers.skill_loader import SkillLoader
+from managers.background_manager import BackgroundManager
+from managers.task_manager import TaskManager
+from managers.teammate_manager import TeammateManager
+from managers.message_bus import MessageBus
+from managers.shutdown_manager import handle_shutdown_request, handle_plan_review
+
+
+class ToolDispatcher:
+    """工具分发器 - 将工具名映射到处理函数"""
+    
+    def __init__(
+        self,
+        todo_mgr: TodoManager,
+        skill_loader: SkillLoader,
+        task_mgr: TaskManager,
+        bg_mgr: BackgroundManager,
+        team_mgr: TeammateManager,
+        bus: MessageBus
+    ):
+        """
+        初始化工具分发器
+        
+        Args:
+            todo_mgr: Todo 管理器
+            skill_loader: 技能加载器
+            task_mgr: 任务管理器
+            bg_mgr: 后台任务管理器
+            team_mgr: 队友管理器
+            bus: 消息总线
+        """
+        self.todo_mgr = todo_mgr
+        self.skill_loader = skill_loader
+        self.task_mgr = task_mgr
+        self.bg_mgr = bg_mgr
+        self.team_mgr = team_mgr
+        self.bus = bus
+    
+    def get_handler(self, tool_name: str) -> Optional[Callable]:
+        """
+        获取工具处理函数
+        
+        Args:
+            tool_name: 工具名称
+            
+        Returns:
+            处理函数，如果不存在返回 None
+        """
+        handlers: Dict[str, Callable] = {
+            # 基础工具
+            "bash": lambda **kw: run_bash(kw["command"]),
+            "read_file": lambda **kw: run_read(kw["path"], kw.get("limit")),
+            "write_file": lambda **kw: run_write(kw["path"], kw["content"]),
+            "edit_file": lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"]),
+            # Todo 管理
+            "TodoWrite": lambda **kw: self.todo_mgr.update(kw["items"]),
+            # 子 Agent
+            "task": lambda **kw: run_subagent(kw["prompt"], kw.get("agent_type", "Explore")),
+            # 技能加载
+            "load_skill": lambda **kw: self.skill_loader.load(kw["name"]),
+            # 压缩（由 MainAgent 捕获后执行）
+            "compress": lambda **kw: "Compressing...",
+            # 后台任务
+            "background_run": lambda **kw: self.bg_mgr.run(kw["command"], kw.get("timeout", 120)),
+            "check_background": lambda **kw: self.bg_mgr.check(kw.get("task_id")),
+            # 文件任务
+            "task_create": lambda **kw: self.task_mgr.create(kw["subject"], kw.get("description", "")),
+            "task_get": lambda **kw: self.task_mgr.get(kw["task_id"]),
+            "task_update": lambda **kw: self.task_mgr.update(
+                kw["task_id"],
+                kw.get("status"),
+                kw.get("add_blocked_by"),
+                kw.get("remove_blocked_by"),
+            ),
+            "task_list": lambda **kw: self.task_mgr.list_all(),
+            # 队友管理
+            "spawn_teammate": lambda **kw: self.team_mgr.spawn(kw["name"], kw["role"], kw["prompt"]),
+            "list_teammates": lambda **kw: self.team_mgr.list_all(),
+            # 消息通信
+            "send_message": lambda **kw: self.bus.send("lead", kw["to"], kw["content"], kw.get("msg_type", "message")),
+            "read_inbox": lambda **kw: json.dumps(self.bus.read_inbox("lead"), indent=2),
+            "broadcast": lambda **kw: self.bus.broadcast("lead", kw["content"], self.team_mgr.member_names()),
+            # 关闭和审批
+            "shutdown_request": lambda **kw: handle_shutdown_request(self.bus, kw["teammate"]),
+            "plan_approval": lambda **kw: handle_plan_review(
+                self.bus,
+                kw["request_id"],
+                kw["approve"],
+                kw.get("feedback", ""),
+            ),
+            # 其他
+            "idle": lambda **kw: "Lead does not idle.",
+            "claim_task": lambda **kw: self.task_mgr.claim(kw["task_id"], "lead"),
+        }
+        return handlers.get(tool_name)
+
+    def get_tools(self) -> list:
+        """返回提供给 LLM 的工具定义"""
+        return [
+            {"name": "bash", "description": "Run a shell command.",
+             "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
+            {"name": "read_file", "description": "Read file contents.",
+             "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["path"]}},
+            {"name": "write_file", "description": "Write content to file.",
+             "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}},
+            {"name": "edit_file", "description": "Replace exact text in file.",
+             "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, "required": ["path", "old_text", "new_text"]}},
+            {"name": "TodoWrite", "description": "Update task tracking list.",
+             "input_schema": {"type": "object", "properties": {"items": {"type": "array", "items": {"type": "object", "properties": {"content": {"type": "string"}, "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]}, "activeForm": {"type": "string"}}, "required": ["content", "status", "activeForm"]}}}, "required": ["items"]}},
+            {"name": "task", "description": "Spawn a subagent for isolated exploration or work.",
+             "input_schema": {"type": "object", "properties": {"prompt": {"type": "string"}, "agent_type": {"type": "string", "enum": ["Explore", "general-purpose"]}}, "required": ["prompt"]}},
+            {"name": "load_skill", "description": "Load specialized knowledge by name.",
+             "input_schema": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}},
+            {"name": "compress", "description": "Manually compress conversation context.",
+             "input_schema": {"type": "object", "properties": {}}},
+            {"name": "background_run", "description": "Run command in background thread.",
+             "input_schema": {"type": "object", "properties": {"command": {"type": "string"}, "timeout": {"type": "integer"}}, "required": ["command"]}},
+            {"name": "check_background", "description": "Check background task status.",
+             "input_schema": {"type": "object", "properties": {"task_id": {"type": "string"}}}},
+            {"name": "task_create", "description": "Create a persistent file task.",
+             "input_schema": {"type": "object", "properties": {"subject": {"type": "string"}, "description": {"type": "string"}}, "required": ["subject"]}},
+            {"name": "task_get", "description": "Get task details by ID.",
+             "input_schema": {"type": "object", "properties": {"task_id": {"type": "integer"}}, "required": ["task_id"]}},
+            {"name": "task_update", "description": "Update task status or dependencies.",
+             "input_schema": {"type": "object", "properties": {"task_id": {"type": "integer"}, "status": {"type": "string", "enum": ["pending", "in_progress", "completed", "deleted"]}, "add_blocked_by": {"type": "array", "items": {"type": "integer"}}, "remove_blocked_by": {"type": "array", "items": {"type": "integer"}}}, "required": ["task_id"]}},
+            {"name": "task_list", "description": "List all tasks.",
+             "input_schema": {"type": "object", "properties": {}}},
+            {"name": "spawn_teammate", "description": "Spawn a persistent autonomous teammate.",
+             "input_schema": {"type": "object", "properties": {"name": {"type": "string"}, "role": {"type": "string"}, "prompt": {"type": "string"}}, "required": ["name", "role", "prompt"]}},
+            {"name": "list_teammates", "description": "List all teammates.",
+             "input_schema": {"type": "object", "properties": {}}},
+            {"name": "send_message", "description": "Send a message to a teammate.",
+             "input_schema": {"type": "object", "properties": {"to": {"type": "string"}, "content": {"type": "string"}, "msg_type": {"type": "string", "enum": ["message", "broadcast", "shutdown_request", "shutdown_response", "plan_approval_response"]}}, "required": ["to", "content"]}},
+            {"name": "read_inbox", "description": "Read and drain the lead's inbox.",
+             "input_schema": {"type": "object", "properties": {}}},
+            {"name": "broadcast", "description": "Send message to all teammates.",
+             "input_schema": {"type": "object", "properties": {"content": {"type": "string"}}, "required": ["content"]}},
+            {"name": "shutdown_request", "description": "Request a teammate to shut down.",
+             "input_schema": {"type": "object", "properties": {"teammate": {"type": "string"}}, "required": ["teammate"]}},
+            {"name": "plan_approval", "description": "Approve or reject a teammate's plan.",
+             "input_schema": {"type": "object", "properties": {"request_id": {"type": "string"}, "approve": {"type": "boolean"}, "feedback": {"type": "string"}}, "required": ["request_id", "approve"]}},
+            {"name": "idle", "description": "Enter idle state.",
+             "input_schema": {"type": "object", "properties": {}}},
+            {"name": "claim_task", "description": "Claim a task from the board.",
+             "input_schema": {"type": "object", "properties": {"task_id": {"type": "integer"}}, "required": ["task_id"]}},
+        ]
