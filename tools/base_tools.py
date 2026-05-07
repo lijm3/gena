@@ -1,14 +1,14 @@
 """
 基础工具 - s01: Agent 与环境交互的最基本工具
 """
-from pathlib import Path
 from typing import Optional
 
 from config.settings import WORKDIR
 from utils.path_utils import safe_path
+from utils.loop_control import ToolResult
 
 
-def run_bash(command: str) -> str:
+def run_bash(command: str) -> ToolResult:
     """
     执行 Shell 命令（带安全检查）
     
@@ -21,7 +21,12 @@ def run_bash(command: str) -> str:
     # 危险命令黑名单
     dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
     if any(d in command for d in dangerous):
-        return "错误: 危险命令被阻止"
+        return ToolResult(
+            content="错误: 危险命令被阻止",
+            changed=False,
+            done=True,
+            error=True
+        )
     
     try:
         from utils.encoding_utils import safe_subprocess_run
@@ -31,14 +36,25 @@ def run_bash(command: str) -> str:
             timeout=120
         )
         out = (r.stdout + r.stderr).strip()
-        return out[:50000] if out else "(无输出)"
+        output = out[:50000] if out else "(无输出)"
+        return ToolResult(content=output, changed=True, done=True)
     except Exception as e:
         if "timed out" in str(e).lower():
-            return "错误: 超时 (120秒)"
-        return f"错误: {e}"
+            return ToolResult(
+                content="错误: 超时 (120秒)",
+                changed=False,
+                done=False,
+                error=True
+            )
+        return ToolResult(
+            content=f"错误: {e}",
+            changed=False,
+            done=False,
+            error=True
+        )
 
 
-def run_read(path: str, limit: Optional[int] = None) -> str:
+def run_read(path: str, limit: Optional[int] = None) -> ToolResult:
     """
     读取文件内容
     
@@ -53,12 +69,17 @@ def run_read(path: str, limit: Optional[int] = None) -> str:
         lines = safe_path(path).read_text().splitlines()
         if limit and limit < len(lines):
             lines = lines[:limit] + [f"... (还有 {len(lines) - limit} 行)"]
-        return "\n".join(lines)[:50000]
+        return ToolResult(content="\n".join(lines)[:50000], changed=False, done=True)
     except Exception as e:
-        return f"错误: {e}"
+        return ToolResult(
+            content=f"错误: {e}",
+            changed=False,
+            done=False,
+            error=True
+        )
 
 
-def run_write(path: str, content: str) -> str:
+def run_write(path: str, content: str) -> ToolResult:
     """
     写入文件内容
     
@@ -71,14 +92,28 @@ def run_write(path: str, content: str) -> str:
     """
     try:
         fp = safe_path(path)
+        if fp.exists():
+            existing = fp.read_text()
+            if existing == content:
+                return ToolResult(
+                    content=f"文件 {path} 内容未变化",
+                    changed=False,
+                    done=True
+                )
+
         fp.parent.mkdir(parents=True, exist_ok=True)
         fp.write_text(content)
-        return f"已写入 {len(content)} 字节到 {path}"
+        return ToolResult(content=f"已写入 {len(content)} 字节到 {path}", changed=True, done=True)
     except Exception as e:
-        return f"错误: {e}"
+        return ToolResult(
+            content=f"错误: {e}",
+            changed=False,
+            done=False,
+            error=True
+        )
 
 
-def run_edit(path: str, old_text: str, new_text: str) -> str:
+def run_edit(path: str, old_text: str, new_text: str) -> ToolResult:
     """
     精确编辑文件（字符串替换）
     
@@ -94,8 +129,23 @@ def run_edit(path: str, old_text: str, new_text: str) -> str:
         fp = safe_path(path)
         c = fp.read_text()
         if old_text not in c:
-            return f"错误: 在 {path} 中找不到指定文本"
-        fp.write_text(c.replace(old_text, new_text, 1))
-        return f"已编辑 {path}"
+            return ToolResult(
+                content=f"错误: 在 {path} 中找不到指定文本",
+                changed=False,
+                done=True,
+                error=True
+            )
+
+        updated = c.replace(old_text, new_text, 1)
+        if updated == c:
+            return ToolResult(content=f"文件 {path} 无变化", changed=False, done=True)
+
+        fp.write_text(updated)
+        return ToolResult(content=f"已编辑 {path}", changed=True, done=True)
     except Exception as e:
-        return f"错误: {e}"
+        return ToolResult(
+            content=f"错误: {e}",
+            changed=False,
+            done=False,
+            error=True
+        )

@@ -4,6 +4,7 @@
 from typing import List, Dict, Any, Optional
 
 from core.llm_client import LLMClient
+from utils.loop_control import ToolResult
 
 
 def run_subagent(prompt: str, agent_type: str = "Explore") -> str:
@@ -59,7 +60,7 @@ def run_subagent(prompt: str, agent_type: str = "Explore") -> str:
             tools=sub_tools,
             max_tokens=8000
         )
-        print(f"子Agent第{sub_call_llm}调用返回:{resp["content"]}")
+        print(f"子Agent第{sub_call_llm}调用返回:{resp['content']}")
 
         sub_msgs.append({"role": "assistant", "content": resp["content"]})
         
@@ -71,10 +72,12 @@ def run_subagent(prompt: str, agent_type: str = "Explore") -> str:
         for block in resp["content"]:
             if block["type"] == "tool_use":
                 h = sub_handlers.get(block["name"], lambda **kw: "Unknown tool")
+                output = h(**block["input"])
+                tool_output = output.to_llm_format() if isinstance(output, ToolResult) else str(output)
                 results.append({
                     "type": "tool_result",
                     "tool_use_id": block["id"],
-                    "content": str(h(**block["input"]))[:50000]
+                    "content": tool_output[:50000]
                 })
         sub_msgs.append({"role": "user", "content": results})
     
