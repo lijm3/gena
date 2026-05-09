@@ -77,6 +77,16 @@ class LLMConfig:
         """获取请求超时时间（秒）"""
         return int(os.environ.get("REQUEST_TIMEOUT", "60"))
 
+    @staticmethod
+    def get_stream() -> bool:
+        """是否使用 SSE 流式（部分网关仅支持 stream=true）"""
+        return os.environ.get("LLM_STREAM", "true").lower() in ("1", "true", "yes")
+
+    @staticmethod
+    def get_stream_print() -> bool:
+        """流式时是否将文本增量打印到 stdout"""
+        return os.environ.get("LLM_STREAM_PRINT", "false").lower() in ("1", "true", "yes")
+
 # === 消息类型白名单 ===
 VALID_MSG_TYPES = {"message", "broadcast", "shutdown_request",
                    "shutdown_response", "plan_approval_response"}
