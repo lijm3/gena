@@ -8,6 +8,9 @@ from managers.message_bus import MessageBus
 
 # 全局跟踪字典
 shutdown_requests: Dict[str, Dict[str, Any]] = {}
+# NOTE: plan_requests 当前未启用——没有任何代码路径会往里写。
+# handle_plan_review 函数保留供未来"队友提交计划→主控审批"流程复用；
+# 对应的 LLM 工具 plan_approval 已从 ToolDispatcher 下线，避免模型调到死路径。
 plan_requests: Dict[str, Dict[str, Any]] = {}
 
 

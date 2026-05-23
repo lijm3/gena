@@ -1,0 +1,8 @@
+# gena — 开发与可选依赖
+
+# === 测试框架 ===
+pytest>=7.0
+
+# === 可选增强 ===
+# tiktoken：装了 estimate_tokens 会更准；不装走 UTF-8 字节回退算法。
+tiktoken>=0.5

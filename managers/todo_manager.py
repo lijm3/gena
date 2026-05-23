@@ -3,6 +3,10 @@ Todo 管理器 - s03: 会话内任务清单
 """
 from typing import List, Dict, Any
 
+from utils.logging_setup import get_logger
+
+log = get_logger(__name__)
+
 
 class TodoManager:
     """
@@ -65,6 +69,13 @@ class TodoManager:
             raise ValueError("只允许一个 in_progress")
         
         self.items = validated
+        log.info(
+            "todos updated: %d total (%d completed, %d in_progress, %d pending)",
+            len(self.items),
+            sum(1 for t in self.items if t["status"] == "completed"),
+            sum(1 for t in self.items if t["status"] == "in_progress"),
+            sum(1 for t in self.items if t["status"] == "pending"),
+        )
         return self.render()
     
     def render(self) -> str:

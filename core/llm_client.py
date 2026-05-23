@@ -2,11 +2,13 @@
 LLM 客户端 - 统一的 LLM API 调用
 """
 import json
+import time
 from typing import Any, Dict, List, Optional
 
 import requests
 
 from config.settings import LLMConfig
+from utils.llm_logger import llm_logger
 
 # 多数 LLM 网关返回 UTF-8，但未带 charset；requests 默认按 ISO-8859-1 解码会导致中文乱码。
 _DEFAULT_TEXT_ENCODING = "utf-8"
@@ -86,9 +88,13 @@ def _consume_stream(response: requests.Response, emit_stream: bool) -> Dict[str,
         "model": None,
         "usage": None,
     }
-    for line in response.iter_lines(decode_unicode=True):
-        if not line:
+    # 走字节流再手动 decode：requests 的 decode_unicode=True 会按 chunk decode，
+    # 多字节字符跨 TCP 包边界时尾部字节会被 replace 成 � 导致丢字。
+    # SSE 行尾是 \n（ASCII），按字节切行不会切坏 UTF-8 多字节序列。
+    for raw_line in response.iter_lines(decode_unicode=False):
+        if not raw_line:
             continue
+        line = raw_line.decode("utf-8", errors="replace")
         if not line.startswith("data:"):
             continue
         raw = line[5:].strip()
@@ -175,29 +181,48 @@ class LLMClient:
 
         url = f"{self.base_url}/v1/messages"
 
-        if not use_stream:
+        # 日志只记 payload(已剥离 auth header),便于事后复现这一轮 LLM 看到了什么
+        started = time.monotonic()
+
+        def _emit(resp: Optional[Dict[str, Any]] = None, err: Optional[str] = None) -> None:
+            llm_logger.log_call(
+                request=payload,
+                response=resp,
+                error=err,
+                duration_ms=(time.monotonic() - started) * 1000,
+            )
+
+        try:
+            if not use_stream:
+                response = requests.post(
+                    url,
+                    headers=self._headers(),
+                    json=payload,
+                    timeout=self.timeout,
+                )
+                response.raise_for_status()
+                _ensure_utf8_response(response)
+                data = response.json()
+                _emit(resp=data)
+                return data
+
             response = requests.post(
                 url,
                 headers=self._headers(),
                 json=payload,
                 timeout=self.timeout,
+                stream=True,
             )
             response.raise_for_status()
-            _ensure_utf8_response(response)
-            return response.json()
-
-        response = requests.post(
-            url,
-            headers=self._headers(),
-            json=payload,
-            timeout=self.timeout,
-            stream=True,
-        )
-        response.raise_for_status()
-        try:
-            return _consume_stream(response, emit_stream=emit)
-        finally:
-            response.close()
+            try:
+                data = _consume_stream(response, emit_stream=emit)
+            finally:
+                response.close()
+            _emit(resp=data)
+            return data
+        except Exception as e:
+            _emit(err=f"{type(e).__name__}: {e}")
+            raise
 
     def create_message(
         self,

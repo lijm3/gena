@@ -1,0 +1,15 @@
+{
+  "_comment": "示例配置：复制为 .claude/hooks.json 并 touch .claude/.claude_trusted 后生效。",
+  "hooks": {
+    "SessionStart": [
+      { "command": "python hooks/announce_session.py" }
+    ],
+    "PreToolUse": [
+      { "matcher": "bash",       "command": "python hooks/audit_bash.py" },
+      { "matcher": "*",          "command": "python hooks/log_call.py" }
+    ],
+    "PostToolUse": [
+      { "matcher": "*",          "command": "python hooks/log_call.py" }
+    ]
+  }
+}

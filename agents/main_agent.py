@@ -2,7 +2,8 @@
 主 Agent - s15: Agent 主循环
 """
 import json
-from typing import List, Dict, Any
+import time
+from typing import List, Dict, Any, Optional
 
 from config.settings import (
     WORKDIR,
@@ -16,6 +17,7 @@ from config.settings import (
     PROGRESS_SIMILARITY_THRESHOLD,
     WALL_CLOCK_TIMEOUT,
     TOKEN_BUDGET,
+    LLM_DEBUG_PRINT,
 )
 from core.llm_client import LLMClient
 from managers.todo_manager import TodoManager
@@ -24,9 +26,20 @@ from managers.message_bus import MessageBus
 from managers.task_manager import TaskManager
 from managers.skill_loader import SkillLoader
 from managers.teammate_manager import TeammateManager
+from managers.hook_manager import (
+    HookManager, HookContext, extract_tool_status, stringify_tool_output,
+)
 from tools.tool_dispatcher import ToolDispatcher
 from utils.compression import auto_compact, estimate_tokens, microcompact
-from utils.loop_control import LoopDetector, ProgressTracker, BudgetController, ToolResult
+from utils.loop_control import LoopDetector, ProgressTracker, BudgetController, ToolResult, format_tool_calls
+from utils.log_sanitize import sanitize_for_log
+from utils.logging_setup import get_logger
+
+log = get_logger(__name__)
+
+# 网关偶尔会返回空 content + stop_reason=end_turn（疑似缓存/路由命中后无生成）。
+# 不做兜底的话用户在 REPL 里看到"无任何回应"，这里给一次"请重新作答"的注入重试。
+MAX_EMPTY_RETRIES = 2
 
 
 class MainAgent:
@@ -49,11 +62,12 @@ class MainAgent:
         bus: MessageBus,
         task_mgr: TaskManager,
         skill_loader: SkillLoader,
-        team_mgr: TeammateManager
+        team_mgr: TeammateManager,
+        hook_manager: Optional[HookManager] = None,
     ):
         """
         初始化主 Agent
-        
+
         Args:
             todo_mgr: Todo 管理器
             bg_mgr: 后台任务管理器
@@ -61,6 +75,7 @@ class MainAgent:
             task_mgr: 任务管理器
             skill_loader: 技能加载器
             team_mgr: 队友管理器
+            hook_manager: 钩子管理器（可选，None 时构造一个空的）
         """
         self.client = LLMClient()
         self.todo_mgr = todo_mgr
@@ -69,8 +84,10 @@ class MainAgent:
         self.task_mgr = task_mgr
         self.skill_loader = skill_loader
         self.team_mgr = team_mgr
+        self.hooks = hook_manager or HookManager()
         self.tool_dispatcher = ToolDispatcher(
-            todo_mgr, skill_loader, task_mgr, bg_mgr, team_mgr, bus
+            todo_mgr, skill_loader, task_mgr, bg_mgr, team_mgr, bus,
+            hook_manager=self.hooks,
         )
         
         self.system_prompt = f"""You are a coding agent at {WORKDIR}. Use tools to solve tasks.
@@ -108,8 +125,17 @@ CRITICAL LOOP PREVENTION RULES:
         rounds = 0
         # 初始化调用大模型次数
         call_llm_count = 0
+        # 空响应连续计数（一旦本轮收到非空响应会清零）
+        empty_retries = 0
         # 初始化预算控制器
         budget_controller = BudgetController(WALL_CLOCK_TIMEOUT, TOKEN_BUDGET)
+
+        # 重置跨请求的循环检测状态。loop_detector / progress_tracker 是 MainAgent 的实例属性，
+        # 不清空会导致上一次对话里的工具指纹/结果摘要继续命中本次：例如用户两次让我"重读同一张图"，
+        # 第二次的 read_image 会被误判为循环，直接 _force_conclusion 静默退出。
+        # 这两个保护机制的语义是"单次请求内的循环防护"，每个 turn 重新开始即可。
+        self.loop_detector = LoopDetector(LOOP_DETECTION_WINDOW, LOOP_DETECTION_THRESHOLD)
+        self.progress_tracker = ProgressTracker(PROGRESS_WINDOW, PROGRESS_SIMILARITY_THRESHOLD)
         
         while True:
             rounds += 1
@@ -132,16 +158,51 @@ CRITICAL LOOP PREVENTION RULES:
             if over_budget:
                 return self._force_conclusion(messages, budget_msg)
 
-            call_llm_count = call_llm_count + 1
-            print(f"第{call_llm_count}调用大模型的上下文:{messages}")
-            
+            call_llm_count += 1
+            log.info("[llm] call #%d messages=%d", call_llm_count, len(messages))
+            if LLM_DEBUG_PRINT:
+                log.debug("[llm-debug] input: %s", sanitize_for_log(messages))
+
             # LLM 调用
             response = self._call_llm(messages)
 
-            print(f"第{call_llm_count}调用大模型的返回:{response['content']}")
+            log.info("[llm] call #%d return blocks=%d stop=%s",
+                     call_llm_count, len(response['content']), response['stop_reason'])
+            if LLM_DEBUG_PRINT:
+                log.debug("[llm-debug] return: %s", sanitize_for_log(response['content']))
 
             messages.append({"role": "assistant", "content": response["content"]})
-            
+
+            # 空响应兜底：网关偶发返回 blocks=0 + stop=end_turn，没有任何文本/工具调用。
+            # 静默退出会让用户在 REPL 里看到"无回应"。先撤掉刚才那条空 assistant，
+            # 注入一条提示让模型重试；累计超过 MAX_EMPTY_RETRIES 就给固定兜底文案。
+            if not response["content"] and response["stop_reason"] != "tool_use":
+                messages.pop()
+                if empty_retries < MAX_EMPTY_RETRIES:
+                    empty_retries += 1
+                    log.warning(
+                        "[llm] call #%d empty response, retrying (%d/%d)",
+                        call_llm_count, empty_retries, MAX_EMPTY_RETRIES,
+                    )
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            "<empty-response-recovery>\n"
+                            "Your previous response was empty. Please answer the user's "
+                            "latest message directly, or call a tool if needed.\n"
+                            "</empty-response-recovery>"
+                        ),
+                    })
+                    continue
+                log.error("[llm] call #%d empty response after %d retries, giving up",
+                          call_llm_count, MAX_EMPTY_RETRIES)
+                messages.append({
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "（模型返回了空响应，请重新提问或换种问法。）"}],
+                })
+                return messages
+            empty_retries = 0
+
             # 如果不再调用工具，退出循环
             if response["stop_reason"] != "tool_use":
                 return messages
@@ -151,6 +212,13 @@ CRITICAL LOOP PREVENTION RULES:
                 block for block in response["content"]
                 if block["type"] == "tool_use"
             ]
+            # 把本轮将要调用的工具列出来——日志里"先说想做什么，再说做了什么"
+            # 即使被硬上限/LoopDetector 拦下，也能看到模型的意图。
+            if tool_calls:
+                log.info(
+                    "[llm] call #%d planning %d tool(s): %s",
+                    call_llm_count, len(tool_calls), format_tool_calls(tool_calls),
+                )
             if len(tool_calls) > MAX_TOOL_CALLS_PER_ROUND:
                 return self._force_conclusion(
                     messages,
@@ -163,7 +231,7 @@ CRITICAL LOOP PREVENTION RULES:
                     return self._force_conclusion(messages, f"Loop detected: {tool_call['name']}")
 
             # 工具执行阶段
-            results, used_todo, manual_compress = self._execute_tools(response)
+            results, used_todo, manual_compress = self._execute_tools(response, rounds)
             total_tool_calls += len(tool_calls)
 
             # 无进展检测：连续多轮结果高度相似时，直接收敛总结。
@@ -181,7 +249,7 @@ CRITICAL LOOP PREVENTION RULES:
             messages.append({"role": "user", "content": results})
 
             if manual_compress:
-                print("[manual compact]")
+                log.info("[manual compact]")
                 messages[:] = auto_compact(messages)
                 return messages
     
@@ -208,7 +276,7 @@ CRITICAL LOOP PREVENTION RULES:
         
         # 自动压缩
         if estimate_tokens(messages) > TOKEN_THRESHOLD:
-            print("[auto-compact triggered]")
+            log.info("[auto-compact triggered]")
             messages[:] = auto_compact(messages)
     
     def _call_llm(self, messages: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -222,7 +290,7 @@ CRITICAL LOOP PREVENTION RULES:
 
 
 
-    def _execute_tools(self, response: Dict[str, Any]) -> tuple:
+    def _execute_tools(self, response: Dict[str, Any], round_num: int = 0) -> tuple:
         """
         results
 
@@ -243,50 +311,164 @@ CRITICAL LOOP PREVENTION RULES:
         results = []
         used_todo = False
         manual_compress = False
-        
+        hooks_active = self.hooks.is_active()
+
+        call_index = 0
         for block in response["content"]:
-            if block["type"] == "tool_use":
-                if block["name"] == "compress":
-                    manual_compress = True
-                handler = self.tool_dispatcher.get_handler(block["name"])
-                try:
-                    output = handler(**block["input"]) if handler else f"Unknown tool: {block['name']}"
-                except Exception as e:
-                    output = f"Error: {e}"
-                
-                print(f"> {block['name']}:")
-                print(str(output)[:200])
-                
-                tool_output = output.to_llm_format() if isinstance(output, ToolResult) else str(output)
+            if block["type"] != "tool_use":
+                continue
+            if block["name"] == "compress":
+                manual_compress = True
+
+            # 拷贝 tool_input 避免被钩子的 updatedInput 直接改到 messages 历史里
+            tool_input = dict(block.get("input") or {})
+
+            # --- PreToolUse ---
+            pre_messages: List[str] = []
+            pre_blocked = False
+            pre_reason = ""
+            if hooks_active:
+                pre_ctx = HookContext(
+                    agent_role="lead",
+                    tool_name=block["name"],
+                    tool_input=tool_input,
+                    round=round_num,
+                    call_index=call_index,
+                )
+                pre = self.hooks.run_hooks("PreToolUse", pre_ctx)
+                pre_messages = pre.messages
+                pre_blocked = pre.blocked
+                pre_reason = pre.block_reason
+                if pre.updated_input is not None:
+                    tool_input = pre.updated_input
+
+            if pre_blocked:
+                blocked_text = f"[Hook 阻断] {pre_reason or 'Blocked by hook'}"
+                if pre_messages:
+                    blocked_text = "\n".join(
+                        [f"[Hook] {m}" for m in pre_messages] + [blocked_text]
+                    )
                 results.append({
                     "type": "tool_result",
                     "tool_use_id": block["id"],
-                    "content": tool_output
+                    "content": blocked_text,
                 })
-                
-                if block["name"] == "TodoWrite":
-                    used_todo = True
-        
+                call_index += 1
+                continue
+
+            # --- 执行工具 ---
+            handler = self.tool_dispatcher.get_handler(block["name"])
+            t0 = time.monotonic()
+            error_str: Optional[str] = None
+            try:
+                output = handler(**tool_input) if handler else f"Unknown tool: {block['name']}"
+            except Exception as e:
+                output = f"Error: {e}"
+                error_str = f"{type(e).__name__}: {e}"
+            duration_ms = int((time.monotonic() - t0) * 1000)
+
+            log.info("> %s: %s", block["name"], str(output)[:200])
+
+            # --- PostToolUse ---
+            post_messages: List[str] = []
+            if hooks_active:
+                post_ctx = HookContext(
+                    agent_role="lead",
+                    tool_name=block["name"],
+                    tool_input=tool_input,
+                    round=round_num,
+                    call_index=call_index,
+                    tool_output_text=stringify_tool_output(output),
+                    tool_output_status=extract_tool_status(output),
+                    duration_ms=duration_ms,
+                    error=error_str,
+                )
+                post = self.hooks.run_hooks("PostToolUse", post_ctx)
+                post_messages = post.messages
+
+            # --- 组装 tool_result ---
+            if isinstance(output, ToolResult):
+                tool_output = output.to_llm_format()
+            elif isinstance(output, list):
+                tool_output = output
+            else:
+                tool_output = str(output)
+
+            tool_output = self._wrap_hook_messages(tool_output, pre_messages, post_messages)
+            results.append({
+                "type": "tool_result",
+                "tool_use_id": block["id"],
+                "content": tool_output
+            })
+
+            # sidecar_blocks：read_image 之类的工具把 image block 放在这里，
+            # 而不是塞进 tool_result.content——很多第三方 Anthropic 兼容网关
+            # 不识别 tool_result 内部的 image，必须把图片提到 user message 顶层。
+            if isinstance(output, ToolResult):
+                sidecar = output.metadata.get("sidecar_blocks")
+                if sidecar:
+                    results.extend(sidecar)
+
+            if block["name"] == "TodoWrite":
+                used_todo = True
+            call_index += 1
+
         return results, used_todo, manual_compress
+
+    @staticmethod
+    def _wrap_hook_messages(tool_output, pre_messages: List[str], post_messages: List[str]):
+        """把钩子注入的 message 拼到 tool_result.content 前后。
+
+        - str：直接前后字符串拼接
+        - list（image 透传场景）：在头/尾各加一个 text block
+        """
+        if not pre_messages and not post_messages:
+            return tool_output
+        prefix = "\n".join(f"[Hook] {m}" for m in pre_messages)
+        suffix = "\n".join(f"[Hook] {m}" for m in post_messages)
+        if isinstance(tool_output, list):
+            blocks = []
+            if prefix:
+                blocks.append({"type": "text", "text": prefix})
+            blocks.extend(tool_output)
+            if suffix:
+                blocks.append({"type": "text", "text": suffix})
+            return blocks
+        parts = []
+        if prefix:
+            parts.append(prefix)
+        parts.append(str(tool_output))
+        if suffix:
+            parts.append(suffix)
+        return "\n".join(parts)
 
     def _force_conclusion(self, messages: List[Dict[str, Any]], reason: str) -> List[Dict[str, Any]]:
         """
         在触发保护机制时强制收敛：
-        1) 注入约束性提示，明确禁止继续调用工具
+        1) 临时拼接约束性提示（不写入 messages），明确禁止继续调用工具
         2) 调用一次无工具 LLM，产出最终答复
+        3) 仅把最终答复写入 messages
+
+        为什么 guardrail 不进 history：
+        如果 <loop-guard>...Stop tool usage now...</loop-guard> 留在历史里，
+        用户下一轮提问时模型会读到"停止使用工具"的指令，导致新问题里也不调工具
+        而是瞎答。临时拼接到 LLM 调用但不污染持久 history 是更干净的做法。
         """
-        guardrail = (
-            f"<loop-guard>\n"
-            f"Stop tool usage now. Reason: {reason}.\n"
-            f"Provide final concise answer with what was done, current status, and next action.\n"
-            f"</loop-guard>"
-        )
-        messages.append({"role": "user", "content": guardrail})
+        log.warning("[force-conclusion] triggered: %s", reason)
+        guardrail_msg = {
+            "role": "user",
+            "content": (
+                f"<loop-guard>\n"
+                f"Stop tool usage now. Reason: {reason}.\n"
+                f"Provide final concise answer with what was done, current status, and next action.\n"
+                f"</loop-guard>"
+            ),
+        }
         final_response = self.client.create_message(
-            messages=messages,
+            messages=[*messages, guardrail_msg],
             system=self.system_prompt,
             tools=None,
-            max_tokens=1200
+            max_tokens=1200,
         )
         messages.append({"role": "assistant", "content": final_response["content"]})
         return messages

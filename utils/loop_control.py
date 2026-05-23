@@ -6,13 +6,59 @@ Agent 循环控制工具集
 2) 重复调用检测（LoopDetector）
 3) 无进展检测（ProgressTracker）
 4) 预算控制（BudgetController）
+5) 工具调用的简短渲染（format_tool_calls）
 """
 import hashlib
 import json
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Tuple, Union
+
+
+# 工具入参里最优先展示的字段名（按工具类型常见关键字段）。
+# 优先匹配第一个找到的键，找不到就 JSON 截断兜底。
+_BRIEF_INPUT_KEYS = ("command", "path", "subject", "to", "prompt", "name", "task_id", "items")
+
+
+def format_tool_calls(tool_calls: List[Dict[str, Any]], max_value_len: int = 60) -> str:
+    """
+    把 LLM 返回的 tool_use blocks 渲染成可读字符串，给日志/调试用。
+
+    输出示例：
+        bash(command='ls -la') | TodoWrite(items=[{...}, {...}]) | task(prompt='research...')
+
+    设计原则：
+    - 避免把巨型 content 字段（write_file 的全文）灌到日志里
+    - 每个工具只挑一个最有代表性的字段展示
+    - 字符串值统一截断，超长加 …
+    """
+    if not tool_calls:
+        return ""
+    parts: List[str] = []
+    for tc in tool_calls:
+        name = tc.get("name", "?")
+        inp = tc.get("input") or {}
+        brief = ""
+        for key in _BRIEF_INPUT_KEYS:
+            if key in inp:
+                v = inp[key]
+                if isinstance(v, str):
+                    v = v if len(v) <= max_value_len else v[:max_value_len] + "…"
+                    brief = f"{key}={v!r}"
+                else:
+                    s = json.dumps(v, ensure_ascii=False, default=str)
+                    s = s if len(s) <= max_value_len else s[:max_value_len] + "…"
+                    brief = f"{key}={s}"
+                break
+        if not brief:
+            try:
+                s = json.dumps(inp, ensure_ascii=False, default=str)
+            except Exception:
+                s = str(inp)
+            brief = s if len(s) <= max_value_len else s[:max_value_len] + "…"
+        parts.append(f"{name}({brief})")
+    return " | ".join(parts)
 
 
 @dataclass
@@ -24,30 +70,38 @@ class ToolResult:
     可以显著降低无效重复调用。
     """
 
-    content: str
+    # content 既可以是纯文本（绝大多数工具），也可以是 Anthropic content block 列表
+    # （read_image 等需要把 image block 透传给模型时使用）。
+    content: Union[str, List[Dict[str, Any]]]
     changed: bool = True
     done: bool = False
     error: bool = False
     metadata: Dict[str, Any] = field(default_factory=dict)
 
-    def to_llm_format(self) -> str:
-        """
-        生成模型可读文本。
-        形如：
-            [DONE | CHANGED]
-            xxx
-        """
-        status_flags: List[str] = []
+    def _status_line(self) -> str:
+        flags: List[str] = []
         if self.done:
-            status_flags.append("DONE")
+            flags.append("DONE")
         if self.changed:
-            status_flags.append("CHANGED")
+            flags.append("CHANGED")
         if self.error:
-            status_flags.append("ERROR")
+            flags.append("ERROR")
         if not self.changed and not self.error:
-            status_flags.append("NO_CHANGE")
+            flags.append("NO_CHANGE")
+        return f"[{' | '.join(flags)}]" if flags else ""
 
-        status_line = f"[{' | '.join(status_flags)}]" if status_flags else ""
+    def to_llm_format(self) -> Union[str, List[Dict[str, Any]]]:
+        """
+        生成模型可读输出。
+
+        - content 为 str：返回 "[DONE | CHANGED]\\nxxx" 形式的文本。
+        - content 为 list（含 image 等 block）：返回 [status_text_block, *content]，
+          直接作为 tool_result.content 透传给 Anthropic Messages 协议。
+        """
+        status_line = self._status_line()
+        if isinstance(self.content, list):
+            prefix = [{"type": "text", "text": status_line}] if status_line else []
+            return [*prefix, *self.content]
         return f"{status_line}\n{self.content}" if status_line else self.content
 
 

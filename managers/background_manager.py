@@ -100,3 +100,45 @@ class BackgroundManager:
         while not self.notifications.empty():
             notifs.append(self.notifications.get_nowait())
         return notifs
+
+    # —— SSH 远程长任务 ——
+
+    def run_ssh(self, host: str, command: str, timeout: int = 600) -> str:
+        """在远程主机后台执行长任务,结果通过同一个 notifications 队列回填。
+
+        与本地 run() 同构:主循环 _preprocess 排空通知时不区分本地/远端,模型看到的格式一致。
+        """
+        import uuid
+        tid = f"ssh-{str(uuid.uuid4())[:6]}"
+        self.tasks[tid] = {
+            "status": "running",
+            "command": f"[{host}] {command}",
+            "result": None,
+        }
+        threading.Thread(
+            target=self._exec_ssh,
+            args=(tid, host, command, timeout),
+            daemon=True,
+        ).start()
+        return f"Background SSH task {tid} started on {host}: {command[:60]}"
+
+    def _exec_ssh(self, tid: str, host: str, command: str, timeout: int):
+        """SSH 后台线程执行函数。"""
+        # 局部 import,避免 background_manager 模块加载就拉 paramiko
+        from utils.ssh_client import ssh_pool
+        try:
+            ok, out = ssh_pool.exec(host, command, timeout=timeout)
+            self.tasks[tid].update({
+                "status": "completed" if ok else "error",
+                "result": (out or "(no output)")[:50000],
+            })
+        except Exception as e:
+            self.tasks[tid].update({
+                "status": "error",
+                "result": f"{type(e).__name__}: {e}",
+            })
+        self.notifications.put({
+            "task_id": tid,
+            "status": self.tasks[tid]["status"],
+            "result": self.tasks[tid]["result"][:500],
+        })

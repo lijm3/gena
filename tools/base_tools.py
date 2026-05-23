@@ -6,6 +6,7 @@ from typing import Optional
 from config.settings import WORKDIR
 from utils.path_utils import safe_path
 from utils.loop_control import ToolResult
+from utils.image_utils import file_to_image_block
 
 
 def run_bash(command: str) -> ToolResult:
@@ -148,4 +149,38 @@ def run_edit(path: str, old_text: str, new_text: str) -> ToolResult:
             changed=False,
             done=False,
             error=True
+        )
+
+
+def run_read_image(path: str) -> ToolResult:
+    """
+    读取本地图片。
+
+    为什么不直接把 image block 塞进 tool_result.content：
+      Anthropic 官方协议允许，但很多第三方网关只在 user message 的顶层 content 列表里
+      识别 image block，放在 tool_result 内部就当看不见。我们改为把 image block 放到
+      ToolResult.metadata["sidecar_blocks"] 里，由 _execute_tools 提到 tool_result 的同级，
+      让图片始终出现在 user message 顶层。
+
+    Args:
+        path: 工作目录下的相对路径或绝对路径
+
+    Returns:
+        ToolResult，content 为一行说明文字；图片在 metadata["sidecar_blocks"] 中
+    """
+    try:
+        block = file_to_image_block(path)
+        size = len(block["source"]["data"]) * 3 // 4
+        return ToolResult(
+            content=f"已加载图片 {path}（{block['source']['media_type']}, ~{size}B），见下方 image block。",
+            changed=False,
+            done=True,
+            metadata={"sidecar_blocks": [block]},
+        )
+    except Exception as e:
+        return ToolResult(
+            content=f"错误: {e}",
+            changed=False,
+            done=True,
+            error=True,
         )

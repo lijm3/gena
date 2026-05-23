@@ -2,3 +2,14 @@ config/.env
 __pycache__/
 **/__pycache__/
 *.pyc
+.team/known_hosts
+.team/config.json
+.team/inbox/
+.logs/
+.transcripts/
+.gena.db
+.gena.db-shm
+.gena.db-wal
+.idea/
+.claude/settings.local.json
+.claude/.claude_trusted

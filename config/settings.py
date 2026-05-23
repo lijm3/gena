@@ -14,10 +14,16 @@ WORKDIR = Path.cwd()  # 工作目录
 
 # === 目录结构 ===
 TEAM_DIR = WORKDIR / ".team"          # 团队配置目录
-INBOX_DIR = TEAM_DIR / "inbox"        # 消息收件箱目录
-TASKS_DIR = WORKDIR / ".tasks"        # 任务存储目录
+INBOX_DIR = TEAM_DIR / "inbox"        # 消息收件箱目录（旧版散文件存储，已弃用；保留常量避免破坏 import）
+TASKS_DIR = WORKDIR / ".tasks"        # 任务存储目录（同上，已弃用）
 SKILLS_DIR = WORKDIR / "skills"       # 技能文档目录
 TRANSCRIPT_DIR = WORKDIR / ".transcripts"  # 对话记录目录
+
+# === 状态存储 ===
+# SQLite 单文件数据库，承载 TaskManager 和 MessageBus 的持久化状态。
+# 替换了旧版按文件存储的 .tasks/*.json 和 .team/inbox/*.jsonl——
+# 旧方案在多 teammate 线程并发场景有 race（_next_id 撞 ID、claim 互覆盖、read_inbox 读写丢消息）。
+DB_PATH = WORKDIR / ".gena.db"
 
 # === 配置参数 ===
 TOKEN_THRESHOLD = int(os.environ.get("TOKEN_THRESHOLD", "100000"))  # 触发自动压缩的 token 阈值
@@ -90,3 +96,16 @@ class LLMConfig:
 # === 消息类型白名单 ===
 VALID_MSG_TYPES = {"message", "broadcast", "shutdown_request",
                    "shutdown_response", "plan_approval_response"}
+
+# === 调试开关 ===
+# 默认关——开启后会把每轮 LLM 调用的完整 messages/response 打到 stdout。
+# 长会话会把十万 token 灌进终端，且可能包含用户输入和文件内容（隐私）。
+# 仅在排查问题时设 LLM_DEBUG_PRINT=true。
+LLM_DEBUG_PRINT = os.environ.get("LLM_DEBUG_PRINT", "false").lower() in ("1", "true", "yes")
+
+# === 日志配置 ===
+# 控制台日志级别：DEBUG / INFO / WARNING / ERROR。默认 INFO。
+LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
+# 文件日志路径：设为空字符串则不写文件。默认写到 .transcripts/agent.log。
+# 文件日志总是记 DEBUG 级——磁盘成本低，排查时不用先调级别再复现。
+LOG_FILE = os.environ.get("LOG_FILE", str(TRANSCRIPT_DIR / "agent.log"))
