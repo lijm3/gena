@@ -1,0 +1,34 @@
+{
+  "_comment": "示例配置文件。复制为 ssh_hosts.json 并填写真实数据。每台 host 必须二选一:key_path(推荐) 或 password_env(legacy)。运行时密码模式不写在 JSON,通过 LLM 工具 ssh_add_host 注册,仅活在内存。",
+  "hosts": [
+    {
+      "name": "staging",
+      "hostname": "10.0.1.42",
+      "port": 22,
+      "username": "deploy",
+      "key_path": "~/.ssh/id_ed25519_staging",
+      "passphrase_env": "SSH_PASSPHRASE_STAGING",
+      "allowed_prefix": "/home/deploy/app",
+      "description": "预发布环境,key + passphrase"
+    },
+    {
+      "name": "build-box",
+      "hostname": "build.internal",
+      "port": 2222,
+      "username": "ci",
+      "key_path": "~/.ssh/id_ed25519_ci",
+      "passphrase_env": null,
+      "allowed_prefix": "/srv/ci-workspace",
+      "description": "构建机,key 无 passphrase"
+    },
+    {
+      "name": "legacy-server",
+      "hostname": "192.168.10.5",
+      "port": 22,
+      "username": "admin",
+      "password_env": "SSH_PASSWORD_LEGACY",
+      "allowed_prefix": "/data/scripts",
+      "description": "老设备,只能密码登录;封闭内网仅做兜底"
+    }
+  ]
+}
