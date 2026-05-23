@@ -114,6 +114,7 @@ REPL 内置斜杠命令（在 `main.py` 中处理，**不是** LLM 工具）：
 - `utils/path_utils.py::safe_path` 用 `Path.is_relative_to(WORKDIR)` 防路径逃逸；所有文件工具必须经它解析，不要直接 `Path(p)`。
 - `tools/base_tools.py::run_bash` 有黑名单（`rm -rf /` / `sudo` / `shutdown` / `reboot` / `> /dev/`）；扩展时不要绕过。
 - `utils/encoding_utils.py::safe_subprocess_run` 是 Windows 中文编码的兼容封装（项目主要在 Windows 环境运行），新加的 subprocess 调用应走它。
+- `tools/git_tools.py` 是 git 操作的受控入口（17 个工具，Phase A+B 已上线）；走 `subprocess.run([...])` 不开 shell，路径过 `safe_path`，分支名走白名单，**永不传 `--no-verify`**。详见 `docs/Git 工具支持方案.md`，Phase C/D（push / reset / restore 等）待办。
 
 ### 8. 钩子机制（Hooks）
 

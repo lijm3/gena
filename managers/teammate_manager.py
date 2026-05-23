@@ -16,6 +16,35 @@ from utils.logging_setup import get_logger
 log = get_logger(__name__)
 
 
+def _dispatch_git_tool(name: str, kw: Dict[str, Any]):
+    """把 teammate 拿到的 git_* 调用映射到 tools.git_tools。
+
+    限定在 teammate 实际开放的工具集（Read 全集 + add + commit + branch_create）；
+    没列出的工具返回 "Unknown tool"——schema 没暴露就不应该被调用。
+    """
+    from tools.git_tools import (
+        git_status, git_current_branch, git_diff, git_log, git_show, git_blame,
+        git_branch_list, git_remote_list, git_tag_list,
+        git_add, git_commit, git_branch_create,
+    )
+    handlers = {
+        "git_status":         lambda: git_status(),
+        "git_current_branch": lambda: git_current_branch(),
+        "git_diff":           lambda: git_diff(kw.get("staged", False), kw.get("stat", False), kw.get("path")),
+        "git_log":            lambda: git_log(kw.get("limit", 20), kw.get("path")),
+        "git_show":           lambda: git_show(kw["ref"], kw.get("stat", False)),
+        "git_blame":          lambda: git_blame(kw["path"], kw.get("line_start"), kw.get("line_end")),
+        "git_branch_list":    lambda: git_branch_list(),
+        "git_remote_list":    lambda: git_remote_list(),
+        "git_tag_list":       lambda: git_tag_list(),
+        "git_add":            lambda: git_add(kw["paths"]),
+        "git_commit":         lambda: git_commit(kw["message"]),
+        "git_branch_create":  lambda: git_branch_create(kw["name"]),
+    }
+    handler = handlers.get(name)
+    return handler() if handler else f"Unknown tool: {name}"
+
+
 class TeammateManager:
     """
     队友管理器 - 持久化 Agent 团队
@@ -177,6 +206,40 @@ class TeammateManager:
                "required": ["host", "command"]}},
             {"name": "ssh_list_hosts", "description": "List registered remote hosts.",
              "input_schema": {"type": "object", "properties": {}}},
+            # Git Read 全集（Phase A）+ 最小写集（add / commit / branch_create）
+            # 不给 stash / unstage / checkout —— 这些属于交互式 / 长事务决策，应回 lead
+            {"name": "git_status", "description": "Show git status (porcelain v2).",
+             "input_schema": {"type": "object", "properties": {}}},
+            {"name": "git_current_branch", "description": "Return current branch name.",
+             "input_schema": {"type": "object", "properties": {}}},
+            {"name": "git_diff", "description": "Show git diff.",
+             "input_schema": {"type": "object", "properties": {
+                "staged": {"type": "boolean"}, "stat": {"type": "boolean"}, "path": {"type": "string"}}}},
+            {"name": "git_log", "description": "Show commit log (oneline).",
+             "input_schema": {"type": "object", "properties": {
+                "limit": {"type": "integer"}, "path": {"type": "string"}}}},
+            {"name": "git_show", "description": "Show a commit's content.",
+             "input_schema": {"type": "object", "properties": {
+                "ref": {"type": "string"}, "stat": {"type": "boolean"}}, "required": ["ref"]}},
+            {"name": "git_blame", "description": "Show line-level authorship of a file.",
+             "input_schema": {"type": "object", "properties": {
+                "path": {"type": "string"}, "line_start": {"type": "integer"}, "line_end": {"type": "integer"}},
+                "required": ["path"]}},
+            {"name": "git_branch_list", "description": "List branches.",
+             "input_schema": {"type": "object", "properties": {}}},
+            {"name": "git_remote_list", "description": "List remotes.",
+             "input_schema": {"type": "object", "properties": {}}},
+            {"name": "git_tag_list", "description": "List tags.",
+             "input_schema": {"type": "object", "properties": {}}},
+            {"name": "git_add", "description": "Stage files.",
+             "input_schema": {"type": "object", "properties": {
+                "paths": {"type": "array", "items": {"type": "string"}}}, "required": ["paths"]}},
+            {"name": "git_commit", "description": "Create a commit from staged changes.",
+             "input_schema": {"type": "object", "properties": {
+                "message": {"type": "string"}}, "required": ["message"]}},
+            {"name": "git_branch_create", "description": "Create + switch to a new branch.",
+             "input_schema": {"type": "object", "properties": {
+                "name": {"type": "string"}}, "required": ["name"]}},
         ]
 
         client = LLMClient()
@@ -313,6 +376,9 @@ class TeammateManager:
                         elif block["name"] == "ssh_list_hosts":
                             from tools.ssh_tools import ssh_list_hosts
                             output = ssh_list_hosts()
+                        elif block["name"].startswith("git_"):
+                            # 集中分派给 tools.git_tools，避免一长串 elif
+                            output = _dispatch_git_tool(block["name"], tool_input)
                         else:
                             output = f"Unknown tool: {block['name']}"
                     except Exception as e:
@@ -339,7 +405,15 @@ class TeammateManager:
 
                     log.debug("[%s] %s: %s", name, block["name"], str(output)[:120])
 
-                    content_text = str(output)
+                    # ToolResult → 走 to_llm_format() 拿到 [DONE | CHANGED] 前缀的 LLM 文本；
+                    # 裸字符串 → 直接用。修复了之前 SSH/git 工具被 str(dataclass) 渲染成 repr 的问题。
+                    from utils.loop_control import ToolResult as _TR
+                    if isinstance(output, _TR):
+                        rendered = output.to_llm_format()
+                        content_text = rendered if isinstance(rendered, str) else str(rendered)
+                    else:
+                        content_text = str(output)
+
                     if pre_messages or post_messages:
                         prefix = "\n".join(f"[Hook] {m}" for m in pre_messages)
                         suffix = "\n".join(f"[Hook] {m}" for m in post_messages)

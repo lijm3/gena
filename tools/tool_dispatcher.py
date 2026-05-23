@@ -9,6 +9,12 @@ from tools.ssh_tools import (
     ssh_exec, ssh_read, ssh_write, ssh_upload, ssh_download, ssh_list_hosts,
     ssh_add_host, ssh_remove_host,
 )
+from tools.git_tools import (
+    git_status, git_current_branch, git_diff, git_log, git_show, git_blame,
+    git_branch_list, git_remote_list, git_tag_list,
+    git_add, git_unstage, git_commit, git_stash_save, git_stash_list,
+    git_stash_pop, git_branch_create, git_checkout_branch,
+)
 from managers.todo_manager import TodoManager
 from agents.subagent import run_subagent
 from managers.skill_loader import SkillLoader
@@ -123,6 +129,24 @@ class ToolDispatcher:
             "background_ssh_exec": lambda **kw: self.bg_mgr.run_ssh(
                 kw["host"], kw["command"], kw.get("timeout", 600),
             ),
+            # === Git 工具（Phase A Read + Phase B Write-Local）===
+            "git_status":          lambda **kw: git_status(),
+            "git_current_branch":  lambda **kw: git_current_branch(),
+            "git_diff":            lambda **kw: git_diff(kw.get("staged", False), kw.get("stat", False), kw.get("path")),
+            "git_log":             lambda **kw: git_log(kw.get("limit", 20), kw.get("path")),
+            "git_show":            lambda **kw: git_show(kw["ref"], kw.get("stat", False)),
+            "git_blame":           lambda **kw: git_blame(kw["path"], kw.get("line_start"), kw.get("line_end")),
+            "git_branch_list":     lambda **kw: git_branch_list(),
+            "git_remote_list":     lambda **kw: git_remote_list(),
+            "git_tag_list":        lambda **kw: git_tag_list(),
+            "git_add":             lambda **kw: git_add(kw["paths"]),
+            "git_unstage":         lambda **kw: git_unstage(kw["paths"]),
+            "git_commit":          lambda **kw: git_commit(kw["message"]),
+            "git_stash_save":      lambda **kw: git_stash_save(kw["message"]),
+            "git_stash_list":      lambda **kw: git_stash_list(),
+            "git_stash_pop":       lambda **kw: git_stash_pop(),
+            "git_branch_create":   lambda **kw: git_branch_create(kw["name"]),
+            "git_checkout_branch": lambda **kw: git_checkout_branch(kw["branch"]),
         }
         return handlers.get(tool_name)
 
@@ -228,4 +252,51 @@ class ToolDispatcher:
                "properties": {"host": {"type": "string"}, "command": {"type": "string"},
                               "timeout": {"type": "integer"}},
                "required": ["host", "command"]}},
+            # === Git 工具 ===
+            {"name": "git_status", "description": "Show git status in porcelain v2 format with branch info.",
+             "input_schema": {"type": "object", "properties": {}}},
+            {"name": "git_current_branch", "description": "Return current branch name; 'HEAD (detached at <sha>)' if detached.",
+             "input_schema": {"type": "object", "properties": {}}},
+            {"name": "git_diff", "description": "Show git diff. staged=true for --cached; stat=true for summary; path optional.",
+             "input_schema": {"type": "object", "properties": {
+                "staged": {"type": "boolean"}, "stat": {"type": "boolean"}, "path": {"type": "string"}}}},
+            {"name": "git_log", "description": "Show commit log (oneline). limit defaults to 20 (max 500); path optional.",
+             "input_schema": {"type": "object", "properties": {
+                "limit": {"type": "integer"}, "path": {"type": "string"}}}},
+            {"name": "git_show", "description": "Show a commit's content. stat=true for summary only.",
+             "input_schema": {"type": "object", "properties": {
+                "ref": {"type": "string"}, "stat": {"type": "boolean"}}, "required": ["ref"]}},
+            {"name": "git_blame", "description": "Show line-level authorship of a file; optional line range.",
+             "input_schema": {"type": "object", "properties": {
+                "path": {"type": "string"}, "line_start": {"type": "integer"}, "line_end": {"type": "integer"}},
+                "required": ["path"]}},
+            {"name": "git_branch_list", "description": "List all local + remote branches.",
+             "input_schema": {"type": "object", "properties": {}}},
+            {"name": "git_remote_list", "description": "List configured remotes.",
+             "input_schema": {"type": "object", "properties": {}}},
+            {"name": "git_tag_list", "description": "List all tags.",
+             "input_schema": {"type": "object", "properties": {}}},
+            {"name": "git_add", "description": "Stage files. paths is a non-empty list; each goes through safe_path.",
+             "input_schema": {"type": "object", "properties": {
+                "paths": {"type": "array", "items": {"type": "string"}}}, "required": ["paths"]}},
+            {"name": "git_unstage", "description": "Unstage files (git reset HEAD -- <paths>).",
+             "input_schema": {"type": "object", "properties": {
+                "paths": {"type": "array", "items": {"type": "string"}}}, "required": ["paths"]}},
+            {"name": "git_commit",
+             "description": "Create a new commit from staged changes. Requires staged non-empty and message length >= 3. Does NOT amend; does NOT skip hooks.",
+             "input_schema": {"type": "object", "properties": {
+                "message": {"type": "string"}}, "required": ["message"]}},
+            {"name": "git_stash_save", "description": "git stash push -m <message>. Message is required.",
+             "input_schema": {"type": "object", "properties": {
+                "message": {"type": "string"}}, "required": ["message"]}},
+            {"name": "git_stash_list", "description": "List all stashes.",
+             "input_schema": {"type": "object", "properties": {}}},
+            {"name": "git_stash_pop", "description": "Pop the top stash. Returns error on conflict.",
+             "input_schema": {"type": "object", "properties": {}}},
+            {"name": "git_branch_create", "description": "Create and switch to a new branch from current HEAD.",
+             "input_schema": {"type": "object", "properties": {
+                "name": {"type": "string"}}, "required": ["name"]}},
+            {"name": "git_checkout_branch", "description": "Switch to an existing branch. Refuses '-' shorthand and file paths.",
+             "input_schema": {"type": "object", "properties": {
+                "branch": {"type": "string"}}, "required": ["branch"]}},
         ]

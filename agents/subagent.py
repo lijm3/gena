@@ -101,6 +101,30 @@ def run_subagent(prompt: str, agent_type: str = "Explore", hook_manager: Optiona
            "required": ["host", "path"]}},
         {"name": "ssh_list_hosts", "description": "List registered remote hosts.",
          "input_schema": {"type": "object", "properties": {}}},
+        # Git Read 层（Phase A）—— Explore 与 general-purpose 都给
+        {"name": "git_status", "description": "Show git status (porcelain v2).",
+         "input_schema": {"type": "object", "properties": {}}},
+        {"name": "git_current_branch", "description": "Return current branch name.",
+         "input_schema": {"type": "object", "properties": {}}},
+        {"name": "git_diff", "description": "Show git diff.",
+         "input_schema": {"type": "object", "properties": {
+            "staged": {"type": "boolean"}, "stat": {"type": "boolean"}, "path": {"type": "string"}}}},
+        {"name": "git_log", "description": "Show commit log (oneline).",
+         "input_schema": {"type": "object", "properties": {
+            "limit": {"type": "integer"}, "path": {"type": "string"}}}},
+        {"name": "git_show", "description": "Show a commit's content.",
+         "input_schema": {"type": "object", "properties": {
+            "ref": {"type": "string"}, "stat": {"type": "boolean"}}, "required": ["ref"]}},
+        {"name": "git_blame", "description": "Show line-level authorship of a file.",
+         "input_schema": {"type": "object", "properties": {
+            "path": {"type": "string"}, "line_start": {"type": "integer"}, "line_end": {"type": "integer"}},
+            "required": ["path"]}},
+        {"name": "git_branch_list", "description": "List branches.",
+         "input_schema": {"type": "object", "properties": {}}},
+        {"name": "git_remote_list", "description": "List remotes.",
+         "input_schema": {"type": "object", "properties": {}}},
+        {"name": "git_tag_list", "description": "List tags.",
+         "input_schema": {"type": "object", "properties": {}}},
     ]
 
     if agent_type != "Explore":
@@ -125,6 +149,25 @@ def run_subagent(prompt: str, agent_type: str = "Explore", hook_manager: Optiona
                "properties": {"host": {"type": "string"},
                               "remote_path": {"type": "string"}, "local_path": {"type": "string"}},
                "required": ["host", "remote_path", "local_path"]}},
+            # Git Write-Local 层（Phase B 子集）—— 不给 unstage / checkout
+            # 理由：subagent 任务短，给 add+commit+stash+branch_create 就够；
+            # checkout 切换分支属于"长事务"决策，应回 lead 决定。
+            {"name": "git_add", "description": "Stage files.",
+             "input_schema": {"type": "object", "properties": {
+                "paths": {"type": "array", "items": {"type": "string"}}}, "required": ["paths"]}},
+            {"name": "git_commit", "description": "Create a commit from staged changes (no amend).",
+             "input_schema": {"type": "object", "properties": {
+                "message": {"type": "string"}}, "required": ["message"]}},
+            {"name": "git_stash_save", "description": "git stash push -m <message>.",
+             "input_schema": {"type": "object", "properties": {
+                "message": {"type": "string"}}, "required": ["message"]}},
+            {"name": "git_stash_list", "description": "List stashes.",
+             "input_schema": {"type": "object", "properties": {}}},
+            {"name": "git_stash_pop", "description": "Pop top stash.",
+             "input_schema": {"type": "object", "properties": {}}},
+            {"name": "git_branch_create", "description": "Create + switch to a new branch.",
+             "input_schema": {"type": "object", "properties": {
+                "name": {"type": "string"}}, "required": ["name"]}},
         ]
 
     # 工具处理函数映射(ssh_add_host / ssh_remove_host 不同步——凭据只能从 Lead-用户对话进入)
@@ -132,6 +175,15 @@ def run_subagent(prompt: str, agent_type: str = "Explore", hook_manager: Optiona
         ssh_exec as _ssh_exec, ssh_read as _ssh_read, ssh_write as _ssh_write,
         ssh_upload as _ssh_upload, ssh_download as _ssh_download,
         ssh_list_hosts as _ssh_list_hosts,
+    )
+    from tools.git_tools import (
+        git_status as _git_status, git_current_branch as _git_current_branch,
+        git_diff as _git_diff, git_log as _git_log, git_show as _git_show,
+        git_blame as _git_blame, git_branch_list as _git_branch_list,
+        git_remote_list as _git_remote_list, git_tag_list as _git_tag_list,
+        git_add as _git_add, git_commit as _git_commit,
+        git_stash_save as _git_stash_save, git_stash_list as _git_stash_list,
+        git_stash_pop as _git_stash_pop, git_branch_create as _git_branch_create,
     )
     sub_handlers = {
         "bash": lambda **kw: run_bash(kw["command"]),
@@ -146,6 +198,23 @@ def run_subagent(prompt: str, agent_type: str = "Explore", hook_manager: Optiona
         "ssh_upload":     lambda **kw: _ssh_upload(kw["host"], kw["local_path"], kw["remote_path"]),
         "ssh_download":   lambda **kw: _ssh_download(kw["host"], kw["remote_path"], kw["local_path"]),
         "ssh_list_hosts": lambda **kw: _ssh_list_hosts(),
+        # Git Read (Phase A) —— 两种 agent_type 都给
+        "git_status":          lambda **kw: _git_status(),
+        "git_current_branch":  lambda **kw: _git_current_branch(),
+        "git_diff":            lambda **kw: _git_diff(kw.get("staged", False), kw.get("stat", False), kw.get("path")),
+        "git_log":             lambda **kw: _git_log(kw.get("limit", 20), kw.get("path")),
+        "git_show":            lambda **kw: _git_show(kw["ref"], kw.get("stat", False)),
+        "git_blame":           lambda **kw: _git_blame(kw["path"], kw.get("line_start"), kw.get("line_end")),
+        "git_branch_list":     lambda **kw: _git_branch_list(),
+        "git_remote_list":     lambda **kw: _git_remote_list(),
+        "git_tag_list":        lambda **kw: _git_tag_list(),
+        # Git Write-Local 子集（仅 general-purpose 用得到，写到 dict 里无害——schema 没列就调不到）
+        "git_add":             lambda **kw: _git_add(kw["paths"]),
+        "git_commit":          lambda **kw: _git_commit(kw["message"]),
+        "git_stash_save":      lambda **kw: _git_stash_save(kw["message"]),
+        "git_stash_list":      lambda **kw: _git_stash_list(),
+        "git_stash_pop":       lambda **kw: _git_stash_pop(),
+        "git_branch_create":   lambda **kw: _git_branch_create(kw["name"]),
     }
 
     # 循环防护组件
