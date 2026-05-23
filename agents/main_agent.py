@@ -42,6 +42,29 @@ log = get_logger(__name__)
 MAX_EMPTY_RETRIES = 2
 
 
+def _classify_guard_reason(reason: str) -> str:
+    """把 _force_conclusion 的 reason 文本归到一个稳定的 metric 标签。
+
+    供 GuardTriggered 钩子用，方便外部按 metric 聚合（hard_cap / budget / loop / progress）。
+    """
+    text = reason.lower()
+    if "wall-clock timeout" in text:
+        return "wall_clock"
+    if "token budget" in text:
+        return "token_budget"
+    if "maximum rounds" in text:
+        return "max_rounds"
+    if "too many tool calls" in text and "one round" in text:
+        return "tool_calls_per_round"
+    if "maximum tool calls" in text:
+        return "max_tool_calls"
+    if "loop detected" in text:
+        return "loop_detected"
+    if "no progress" in text:
+        return "no_progress"
+    return "other"
+
+
 class MainAgent:
     """
     主 Agent - 协调所有机制
@@ -455,6 +478,20 @@ CRITICAL LOOP PREVENTION RULES:
         而是瞎答。临时拼接到 LLM 调用但不污染持久 history 是更干净的做法。
         """
         log.warning("[force-conclusion] triggered: %s", reason)
+
+        # GuardTriggered 钩子：把闸门命中事件抛给外部 metrics/审计（observer-only）
+        try:
+            self.hooks.run_hooks(
+                "GuardTriggered",
+                HookContext(
+                    agent_role="lead",
+                    guard_reason=reason,
+                    guard_metric=_classify_guard_reason(reason),
+                ),
+            )
+        except Exception as e:
+            log.warning("GuardTriggered hook error (ignored): %s", e)
+
         guardrail_msg = {
             "role": "user",
             "content": (

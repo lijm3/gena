@@ -316,6 +316,23 @@ def run_subagent(prompt: str, agent_type: str = "Explore", hook_manager: Optiona
 
     # 触发循环防护时，再请 LLM 给一个无工具的最终总结（不污染 sub_msgs）
     if outcome is None and forced_stop_reason and resp is not None:
+        # GuardTriggered 钩子：subagent 内部循环防护命中（observer-only）
+        if hooks_active:
+            try:
+                hooks.run_hooks(
+                    "GuardTriggered",
+                    HookContext(
+                        agent_role="subagent",
+                        guard_reason=forced_stop_reason,
+                        guard_metric=(
+                            "loop_detected" if "Loop detected" in forced_stop_reason
+                            else "no_progress" if "No progress" in forced_stop_reason
+                            else "other"
+                        ),
+                    ),
+                )
+            except Exception as e:
+                log.warning("subagent GuardTriggered hook error: %s", e)
         guardrail_msg = {
             "role": "user",
             "content": (
@@ -352,6 +369,23 @@ def run_subagent(prompt: str, agent_type: str = "Explore", hook_manager: Optiona
         forced_stop_reason or "normal",
         len(outcome),
     )
+
+    # SubagentStop 钩子：观察用途，不阻断
+    if hooks_active:
+        try:
+            hooks.run_hooks(
+                "SubagentStop",
+                HookContext(
+                    agent_role="subagent",
+                    agent_type=agent_type,
+                    outcome=outcome,
+                    round=sub_call_llm,
+                    guard_reason=forced_stop_reason or "",
+                ),
+            )
+        except Exception as e:
+            log.warning("SubagentStop hook error: %s", e)
+
     return outcome
 
 

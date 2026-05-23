@@ -4,12 +4,31 @@
     "SessionStart": [
       { "command": "python hooks/announce_session.py" }
     ],
+    "UserPromptSubmit": [
+      { "command": "python hooks/log_call.py" }
+    ],
     "PreToolUse": [
       { "matcher": "bash",       "command": "python hooks/audit_bash.py" },
       { "matcher": "*",          "command": "python hooks/log_call.py" }
     ],
     "PostToolUse": [
       { "matcher": "*",          "command": "python hooks/log_call.py" }
+    ],
+    "Stop": [
+      { "command": "python hooks/log_call.py" }
+    ],
+    "SubagentStop": [
+      { "command": "python hooks/log_call.py" }
+    ],
+    "PreCompact": [
+      { "command": "python hooks/log_call.py" }
+    ],
+    "GuardTriggered": [
+      { "command": "python hooks/log_call.py" }
+    ],
+    "SessionEnd": [
+      { "command": "python hooks/log_call.py" }
     ]
-  }
+  },
+  "_perf_note": "LLMRequest/LLMResponse 在每次 LLM 调用都触发（~30-100ms subprocess 开销）。默认不在示例里开启；需要 LLM 级追踪时再单独添加。"
 }

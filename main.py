@@ -16,7 +16,7 @@ from managers.background_manager import BackgroundManager
 from managers.message_bus import MessageBus
 from managers.skill_loader import SkillLoader
 from managers.teammate_manager import TeammateManager
-from managers.hook_manager import HookManager, HookContext
+from managers.hook_manager import HookManager, HookContext, set_current_hook_manager
 from agents.main_agent import MainAgent
 from utils.compression import auto_compact
 from utils.image_utils import file_to_image_block
@@ -77,6 +77,7 @@ def main():
 
     # 钩子管理器：信任门 + .claude/hooks.json；未配置时所有事件零开销跳过。
     hook_mgr = HookManager()
+    set_current_hook_manager(hook_mgr)  # 让 llm_client / compression 等跨模块也能 fire
     team_mgr.set_hook_manager(hook_mgr)
     if hook_mgr.is_active():
         hook_mgr.run_hooks(
@@ -145,17 +146,47 @@ def main():
         if img_count:
             print(f"[loaded {img_count} image(s)]")
 
+        # UserPromptSubmit 钩子：可阻断该轮 / 可前置注入文本
+        if hook_mgr.is_active():
+            up_ctx = HookContext(agent_role="lead", user_prompt=query)
+            up_result = hook_mgr.run_hooks("UserPromptSubmit", up_ctx)
+            if up_result.blocked:
+                print(f"[Hook 阻断] {up_result.block_reason or 'Blocked by hook'}")
+                continue
+            if up_result.messages:
+                injected = "\n".join(f"[Hook] {m}" for m in up_result.messages)
+                content_blocks.insert(0, {"type": "text", "text": injected})
+
         history.append({"role": "user", "content": content_blocks})
         agent.agent_loop(history)
-        
+
         # 显示响应
         response_content = history[-1]["content"]
         if isinstance(response_content, list):
             for block in response_content:
                 if block["type"] == "text":
                     print(block["text"])
-        
+
+        # Stop 钩子：lead 完成响应（observable，不阻断）
+        if hook_mgr.is_active():
+            outcome_text = ""
+            if isinstance(response_content, list):
+                outcome_text = "\n".join(
+                    b["text"] for b in response_content if b.get("type") == "text"
+                )
+            hook_mgr.run_hooks(
+                "Stop",
+                HookContext(agent_role="lead", outcome=outcome_text),
+            )
+
         print()
+
+    # 退出循环 → SessionEnd（1.5s 硬超时，避免拖慢退出）
+    if hook_mgr.is_active():
+        hook_mgr.run_hooks(
+            "SessionEnd",
+            HookContext(agent_role="lead", cwd=str(WORKDIR)),
+        )
 
 
 def _cleanup_on_exit():

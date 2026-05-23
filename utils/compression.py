@@ -119,6 +119,20 @@ def auto_compact(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     Returns:
         压缩后的消息列表
     """
+    # PreCompact 钩子：在落盘和摘要之前触发，让外部审计/落盘有机会先做一次
+    try:
+        from managers.hook_manager import fire_hook, HookContext
+        fire_hook(
+            "PreCompact",
+            HookContext(
+                agent_role="lead",
+                message_count=len(messages),
+                token_estimate=estimate_tokens(messages),
+            ),
+        )
+    except Exception as e:
+        log.warning("PreCompact hook error (ignored): %s", e)
+
     TRANSCRIPT_DIR.mkdir(exist_ok=True)
 
     # 保存完整历史（落盘失败不影响压缩本身）

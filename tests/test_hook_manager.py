@@ -335,3 +335,265 @@ def test_extract_tool_status_from_toolresult():
     assert stringify_tool_output(ToolResult(content="abc", done=True)) == "abc"
     tr = ToolResult(content=[{"type": "text", "text": "hi"}, {"type": "image", "source": {}}])
     assert "hi" in stringify_tool_output(tr)
+
+
+# =========================================================================
+# Phase 2 测试
+# =========================================================================
+
+# ---------------- UserPromptSubmit ----------------
+
+def test_user_prompt_submit_passes_prompt(trusted_workdir):
+    out_file = trusted_workdir / "ups.txt"
+    src = f"""
+        import os
+        with open(r"{out_file}", "w", encoding="utf-8") as f:
+            f.write(os.environ.get("HOOK_USER_PROMPT", ""))
+    """
+    cmd = _write_hook_script(trusted_workdir, "dump_ups", src)
+    _write_config(trusted_workdir, {"UserPromptSubmit": [{"command": cmd}]})
+    mgr = HookManager(workdir=trusted_workdir)
+    mgr.run_hooks("UserPromptSubmit", HookContext(user_prompt="hello world"))
+    assert out_file.read_text(encoding="utf-8") == "hello world"
+
+
+def test_user_prompt_submit_is_blockable(trusted_workdir):
+    """UserPromptSubmit 也属于可阻断事件。"""
+    src = """
+        import sys
+        sys.stderr.write("not allowed")
+        sys.exit(1)
+    """
+    cmd = _write_hook_script(trusted_workdir, "block_prompt", src)
+    _write_config(trusted_workdir, {"UserPromptSubmit": [{"command": cmd}]})
+    mgr = HookManager(workdir=trusted_workdir)
+    r = mgr.run_hooks("UserPromptSubmit", HookContext(user_prompt="anything"))
+    assert r.blocked is True
+    assert "not allowed" in r.block_reason
+
+
+# ---------------- Stop / SubagentStop ----------------
+
+def test_stop_carries_outcome(trusted_workdir):
+    out_file = trusted_workdir / "stop.txt"
+    src = f"""
+        import os
+        with open(r"{out_file}", "w", encoding="utf-8") as f:
+            f.write(os.environ.get("HOOK_OUTCOME", ""))
+    """
+    cmd = _write_hook_script(trusted_workdir, "stop", src)
+    _write_config(trusted_workdir, {"Stop": [{"command": cmd}]})
+    mgr = HookManager(workdir=trusted_workdir)
+    mgr.run_hooks("Stop", HookContext(outcome="final answer"))
+    assert out_file.read_text(encoding="utf-8") == "final answer"
+
+
+def test_subagent_stop_carries_agent_type(trusted_workdir):
+    out_file = trusted_workdir / "subagent_stop.json"
+    src = f"""
+        import json, os
+        record = {{
+            "type": os.environ.get("HOOK_AGENT_TYPE"),
+            "outcome": os.environ.get("HOOK_OUTCOME"),
+            "role": os.environ.get("HOOK_AGENT_ROLE"),
+        }}
+        with open(r"{out_file}", "w", encoding="utf-8") as f:
+            json.dump(record, f)
+    """
+    cmd = _write_hook_script(trusted_workdir, "subagent_stop", src)
+    _write_config(trusted_workdir, {"SubagentStop": [{"command": cmd}]})
+    mgr = HookManager(workdir=trusted_workdir)
+    mgr.run_hooks(
+        "SubagentStop",
+        HookContext(agent_role="subagent", agent_type="Explore", outcome="done"),
+    )
+    record = json.loads(out_file.read_text(encoding="utf-8"))
+    assert record == {"type": "Explore", "outcome": "done", "role": "subagent"}
+
+
+def test_stop_exit_1_degrades_to_inject(trusted_workdir):
+    """Stop 不是可阻断事件，exit 1 应退化为 inject。"""
+    src = """
+        import sys
+        sys.stderr.write("non-blockable")
+        sys.exit(1)
+    """
+    cmd = _write_hook_script(trusted_workdir, "stop_block", src)
+    _write_config(trusted_workdir, {"Stop": [{"command": cmd}]})
+    mgr = HookManager(workdir=trusted_workdir)
+    r = mgr.run_hooks("Stop", HookContext())
+    assert r.blocked is False
+    assert r.messages == ["non-blockable"]
+
+
+# ---------------- SessionEnd（1.5s 超时） ----------------
+
+def test_session_end_has_short_timeout(trusted_workdir, caplog):
+    """SessionEnd 用 1.5s 硬超时；超时后不抛错、不注入消息。
+
+    注意：subprocess.run 在 Windows 上 shell=True 的情况下，timeout 杀的是 cmd.exe，
+    子 python.exe 会成为孤儿继续跑直到自然退出，因此实际 wall-clock 可能比 1.5s 长。
+    这里只断言 "timeout 被 HookManager 识别 + 钩子没成功注入"，不卡精确 wall-clock。
+    """
+    import logging
+    src = """
+        import time, sys
+        time.sleep(3)
+        sys.stderr.write("late-message")
+        sys.exit(2)
+    """
+    cmd = _write_hook_script(trusted_workdir, "slow_end", src)
+    _write_config(trusted_workdir, {"SessionEnd": [{"command": cmd}]})
+    mgr = HookManager(workdir=trusted_workdir)
+    with caplog.at_level(logging.WARNING, logger="managers.hook_manager"):
+        r = mgr.run_hooks("SessionEnd", HookContext())
+    # 必须：
+    # 1) 没把超时异常抛上来
+    # 2) 没收到 inject 消息（钩子被 1.5s 超时切断，stderr 永远没机会被读到）
+    # 3) 日志里能看到 "timeout (1.5s)"
+    assert r.messages == []
+    assert any("timeout (1.5s)" in rec.getMessage() for rec in caplog.records)
+
+
+# ---------------- PreCompact ----------------
+
+def test_pre_compact_carries_counts(trusted_workdir):
+    out_file = trusted_workdir / "compact.json"
+    src = f"""
+        import json, os
+        record = {{
+            "count": os.environ.get("HOOK_MESSAGE_COUNT"),
+            "tokens": os.environ.get("HOOK_TOKEN_ESTIMATE"),
+        }}
+        with open(r"{out_file}", "w", encoding="utf-8") as f:
+            json.dump(record, f)
+    """
+    cmd = _write_hook_script(trusted_workdir, "pc", src)
+    _write_config(trusted_workdir, {"PreCompact": [{"command": cmd}]})
+    mgr = HookManager(workdir=trusted_workdir)
+    mgr.run_hooks(
+        "PreCompact",
+        HookContext(message_count=42, token_estimate=12345),
+    )
+    record = json.loads(out_file.read_text(encoding="utf-8"))
+    assert record == {"count": "42", "tokens": "12345"}
+
+
+# ---------------- LLMRequest / LLMResponse ----------------
+
+def test_llm_request_response_env(trusted_workdir):
+    req_file = trusted_workdir / "req.json"
+    res_file = trusted_workdir / "res.json"
+    req_src = f"""
+        import json, os
+        with open(r"{req_file}", "w", encoding="utf-8") as f:
+            json.dump({{"model": os.environ.get("HOOK_LLM_MODEL"),
+                        "msgs": os.environ.get("HOOK_MESSAGE_COUNT")}}, f)
+    """
+    res_src = f"""
+        import json, os
+        with open(r"{res_file}", "w", encoding="utf-8") as f:
+            json.dump({{
+                "model": os.environ.get("HOOK_LLM_MODEL"),
+                "stop": os.environ.get("HOOK_LLM_STOP_REASON"),
+                "in": os.environ.get("HOOK_LLM_INPUT_TOKENS"),
+                "out": os.environ.get("HOOK_LLM_OUTPUT_TOKENS"),
+                "duration": os.environ.get("HOOK_LLM_DURATION_MS"),
+            }}, f)
+    """
+    req_cmd = _write_hook_script(trusted_workdir, "llmreq", req_src)
+    res_cmd = _write_hook_script(trusted_workdir, "llmres", res_src)
+    _write_config(trusted_workdir, {
+        "LLMRequest": [{"command": req_cmd}],
+        "LLMResponse": [{"command": res_cmd}],
+    })
+    mgr = HookManager(workdir=trusted_workdir)
+    mgr.run_hooks("LLMRequest", HookContext(llm_model="gpt-5.4", message_count=3))
+    mgr.run_hooks(
+        "LLMResponse",
+        HookContext(
+            llm_model="gpt-5.4",
+            llm_stop_reason="end_turn",
+            llm_input_tokens=120,
+            llm_output_tokens=80,
+            llm_duration_ms=512,
+        ),
+    )
+    assert json.loads(req_file.read_text(encoding="utf-8")) == {"model": "gpt-5.4", "msgs": "3"}
+    assert json.loads(res_file.read_text(encoding="utf-8")) == {
+        "model": "gpt-5.4", "stop": "end_turn",
+        "in": "120", "out": "80", "duration": "512",
+    }
+
+
+# ---------------- GuardTriggered ----------------
+
+def test_guard_triggered_carries_reason_and_metric(trusted_workdir):
+    out_file = trusted_workdir / "guard.json"
+    src = f"""
+        import json, os
+        with open(r"{out_file}", "w", encoding="utf-8") as f:
+            json.dump({{
+                "reason": os.environ.get("HOOK_GUARD_REASON"),
+                "metric": os.environ.get("HOOK_GUARD_METRIC"),
+            }}, f)
+    """
+    cmd = _write_hook_script(trusted_workdir, "g", src)
+    _write_config(trusted_workdir, {"GuardTriggered": [{"command": cmd}]})
+    mgr = HookManager(workdir=trusted_workdir)
+    mgr.run_hooks(
+        "GuardTriggered",
+        HookContext(guard_reason="Loop detected: bash", guard_metric="loop_detected"),
+    )
+    record = json.loads(out_file.read_text(encoding="utf-8"))
+    assert record == {"reason": "Loop detected: bash", "metric": "loop_detected"}
+
+
+# ---------------- 全局 HookManager 注册 ----------------
+
+def test_fire_hook_without_manager_returns_empty():
+    """未注册全局 HookManager 时，fire_hook 应返回空 HookResult 而不抛错。"""
+    from managers.hook_manager import fire_hook, get_current_hook_manager, set_current_hook_manager
+    # 先确保当前是 None
+    prev = get_current_hook_manager()
+    try:
+        set_current_hook_manager(None)
+        r = fire_hook("PreCompact", HookContext(message_count=1))
+        assert r.blocked is False and r.messages == []
+    finally:
+        set_current_hook_manager(prev)
+
+
+def test_fire_hook_uses_registered_manager(trusted_workdir):
+    """注册后 fire_hook 走全局实例。"""
+    out_file = trusted_workdir / "fired.txt"
+    src = f"""
+        with open(r"{out_file}", "w", encoding="utf-8") as f:
+            f.write("ok")
+    """
+    cmd = _write_hook_script(trusted_workdir, "fired", src)
+    _write_config(trusted_workdir, {"PreCompact": [{"command": cmd}]})
+    mgr = HookManager(workdir=trusted_workdir)
+
+    from managers.hook_manager import fire_hook, set_current_hook_manager, get_current_hook_manager
+    prev = get_current_hook_manager()
+    try:
+        set_current_hook_manager(mgr)
+        fire_hook("PreCompact", HookContext(message_count=1))
+        assert out_file.read_text(encoding="utf-8") == "ok"
+    finally:
+        set_current_hook_manager(prev)
+
+
+# ---------------- classify_guard_reason ----------------
+
+def test_classify_guard_reason():
+    from agents.main_agent import _classify_guard_reason
+    assert _classify_guard_reason("Maximum rounds reached (12)") == "max_rounds"
+    assert _classify_guard_reason("Maximum tool calls reached (30)") == "max_tool_calls"
+    assert _classify_guard_reason("Too many tool calls in one round (6 > 5)") == "tool_calls_per_round"
+    assert _classify_guard_reason("Wall-clock timeout (61.0s > 60s)") == "wall_clock"
+    assert _classify_guard_reason("Token budget exceeded (200000 > 150000)") == "token_budget"
+    assert _classify_guard_reason("Loop detected: bash") == "loop_detected"
+    assert _classify_guard_reason("No progress detected in recent rounds") == "no_progress"
+    assert _classify_guard_reason("Something else") == "other"

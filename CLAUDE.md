@@ -117,7 +117,12 @@ REPL 内置斜杠命令（在 `main.py` 中处理，**不是** LLM 工具）：
 
 ### 8. 钩子机制（Hooks）
 
-`managers/hook_manager.py` 提供工具/会话级生命周期事件钩子，参考 `tests/hook.py` 的协议（subprocess + exit code 0/1/2 + JSON stdout）。Phase 1 支持三个事件：`SessionStart` / `PreToolUse` / `PostToolUse`，已在 `MainAgent` / `subagent` / `TeammateManager` 三处工具循环都接入。
+`managers/hook_manager.py` 提供工具/会话级生命周期事件钩子，参考 `tests/hook.py` 的协议（subprocess + exit code 0/1/2 + JSON stdout）。已实现 11 个事件，分两期上线但运行时无差异：
+
+**Phase 1（工具/会话级）**：`SessionStart` / `PreToolUse` / `PostToolUse`
+**Phase 2（流程/LLM/防护级）**：`UserPromptSubmit` / `Stop` / `SessionEnd` / `SubagentStop` / `PreCompact` / `LLMRequest` / `LLMResponse` / `GuardTriggered`
+
+接入位置：`MainAgent` / `subagent` / `TeammateManager` 三处工具循环；`main.py` 的 REPL 入口；`core/llm_client.py` 的 LLM 调用；`utils/compression.auto_compact` 的压缩前；以及 `_force_conclusion` 的循环防护命中处。
 
 启用条件（**任一不满足都静默跳过，零开销**）：
 1. 工作区受信：`.claude/.claude_trusted` 文件存在（或 HookManager 以 `sdk_mode=True` 构造）
@@ -125,15 +130,27 @@ REPL 内置斜杠命令（在 `main.py` 中处理，**不是** LLM 工具）：
 
 退出码协议：
 - `0` 继续（stdout 若为合法 JSON，可携带 `updatedInput` / `additionalContext` / `permissionDecision`）
-- `1` 阻断（仅 `PreToolUse`；其他事件退化为注入）
+- `1` 阻断（仅 `PreToolUse` / `UserPromptSubmit`；其他事件退化为注入）
 - `2` 注入 message（stderr 即注入内容）
 - 其它视作错误，按 0 处理
 
-环境变量传给钩子脚本：`HOOK_EVENT` / `HOOK_AGENT_ROLE`（`lead` / `subagent` / teammate 名）/ `HOOK_TOOL_NAME` / `HOOK_TOOL_INPUT`（JSON）/ `HOOK_ROUND` / `HOOK_CALL_INDEX`，PostToolUse 另带 `HOOK_TOOL_OUTPUT` / `HOOK_OUTPUT_STATUS`（`DONE` / `CHANGED` / `NO_CHANGE` / `ERROR` / `UNKNOWN`）/ `HOOK_DURATION_MS` / `HOOK_ERROR`。
+环境变量按事件分组传给钩子脚本：
+- 公共：`HOOK_EVENT` / `HOOK_AGENT_ROLE`（`lead` / `subagent` / teammate 名）/ `HOOK_CWD`
+- 工具事件：`HOOK_TOOL_NAME` / `HOOK_TOOL_INPUT`（JSON）/ `HOOK_ROUND` / `HOOK_CALL_INDEX`
+- `PostToolUse`：`HOOK_TOOL_OUTPUT` / `HOOK_OUTPUT_STATUS`（`DONE` / `CHANGED` / `NO_CHANGE` / `ERROR` / `UNKNOWN`）/ `HOOK_DURATION_MS` / `HOOK_ERROR`
+- `UserPromptSubmit`：`HOOK_USER_PROMPT`
+- `Stop` / `SubagentStop`：`HOOK_OUTCOME`；`SubagentStop` 另带 `HOOK_AGENT_TYPE`
+- `PreCompact`：`HOOK_MESSAGE_COUNT` / `HOOK_TOKEN_ESTIMATE`
+- `LLMRequest` / `LLMResponse`：`HOOK_LLM_MODEL` / `HOOK_MESSAGE_COUNT`；`LLMResponse` 另带 `HOOK_LLM_STOP_REASON` / `HOOK_LLM_INPUT_TOKENS` / `HOOK_LLM_OUTPUT_TOKENS` / `HOOK_LLM_DURATION_MS`
+- `GuardTriggered`：`HOOK_GUARD_REASON` / `HOOK_GUARD_METRIC`（`max_rounds` / `max_tool_calls` / `tool_calls_per_round` / `wall_clock` / `token_budget` / `loop_detected` / `no_progress` / `other`）
+
+跨模块触发：`from managers.hook_manager import fire_hook` —— `core/llm_client.py` / `utils/compression.py` 等不持有 HookManager 引用的位置走这个便捷函数。`main.py` 启动时通过 `set_current_hook_manager(hook_mgr)` 注册全局实例。
 
 注意：
 - 钩子被阻断的工具调用**仍计入** `MAX_TOOL_CALLS` / `LoopDetector`，防止用钩子绕过 loop guard。
-- 钩子默认 30s 硬超时，超时按 exit 0 处理。
+- 默认 30s 超时；`SessionEnd` 单独走 1.5s。
+- **Windows + `shell=True`** 下 `subprocess.run` 的 timeout 只杀 shell，子 python.exe 会成为孤儿继续跑——所以 SessionEnd 的"1.5s 硬切"实际可能在管道层多等一会儿（不影响主流程，只是 SessionEnd 收尾会慢一点）。
+- **`LLMRequest` / `LLMResponse` 是高频事件**（每次 LLM 调用都触发，每次 ~30-100ms subprocess 开销），需要 LLM 级追踪时优先用进程内的 `utils/llm_logger.py`，或在钩子脚本里做采样。
 - 钩子任何异常都不会向上抛——HookManager 内 except 兜底。
 - 详见 `docs/钩子机制方案.md`；示例配置 `.claude/hooks.json.example`，示例脚本 `hooks/`。
 

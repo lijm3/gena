@@ -192,6 +192,20 @@ class LLMClient:
                 duration_ms=(time.monotonic() - started) * 1000,
             )
 
+        # LLMRequest 钩子：每次 LLM 调用之前触发（observer-only；高频，性能敏感）
+        try:
+            from managers.hook_manager import fire_hook, HookContext
+            fire_hook(
+                "LLMRequest",
+                HookContext(
+                    agent_role="lead",
+                    llm_model=self.model,
+                    message_count=len(messages),
+                ),
+            )
+        except Exception:
+            pass
+
         try:
             if not use_stream:
                 response = requests.post(
@@ -204,6 +218,7 @@ class LLMClient:
                 _ensure_utf8_response(response)
                 data = response.json()
                 _emit(resp=data)
+                self._fire_llm_response(data, started)
                 return data
 
             response = requests.post(
@@ -219,10 +234,30 @@ class LLMClient:
             finally:
                 response.close()
             _emit(resp=data)
+            self._fire_llm_response(data, started)
             return data
         except Exception as e:
             _emit(err=f"{type(e).__name__}: {e}")
             raise
+
+    def _fire_llm_response(self, data: Dict[str, Any], started: float) -> None:
+        """LLM 调用成功后触发 LLMResponse 钩子。失败静默吞掉。"""
+        try:
+            from managers.hook_manager import fire_hook, HookContext
+            usage = data.get("usage") or {}
+            fire_hook(
+                "LLMResponse",
+                HookContext(
+                    agent_role="lead",
+                    llm_model=data.get("model") or self.model,
+                    llm_stop_reason=str(data.get("stop_reason") or ""),
+                    llm_input_tokens=int(usage.get("input_tokens", 0) or 0),
+                    llm_output_tokens=int(usage.get("output_tokens", 0) or 0),
+                    llm_duration_ms=int((time.monotonic() - started) * 1000),
+                ),
+            )
+        except Exception:
+            pass
 
     def create_message(
         self,
